@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 
 use derive_more::{Display, From};
-use regex::Regex;
+use regex::{Regex, RegexSet, RegexSetBuilder};
 
 use super::{
     client::Client,
@@ -33,8 +33,11 @@ pub enum Error {
 /// the respective `SubParser`
 #[derive(Debug)]
 pub struct UserAgentParser {
+    device_matcher: RegexSet,
     device_matchers: Vec<device::Matcher>,
+    os_matcher: RegexSet,
     os_matchers: Vec<os::Matcher>,
+    user_agent_matcher: RegexSet,
     user_agent_matchers: Vec<user_agent::Matcher>,
 }
 
@@ -56,9 +59,7 @@ impl Parser for UserAgentParser {
     fn parse_device(&self, user_agent: &str) -> Device {
         self.device_matchers
             .iter()
-            .filter_map(|matcher| matcher.try_parse(user_agent))
-            .take(1)
-            .next()
+            .find_map(|matcher| matcher.try_parse(user_agent))
             .unwrap_or_default()
     }
 
@@ -66,9 +67,7 @@ impl Parser for UserAgentParser {
     fn parse_os(&self, user_agent: &str) -> OS {
         self.os_matchers
             .iter()
-            .filter_map(|matcher| matcher.try_parse(user_agent))
-            .take(1)
-            .next()
+            .find_map(|matcher| matcher.try_parse(user_agent))
             .unwrap_or_default()
     }
 
@@ -76,9 +75,7 @@ impl Parser for UserAgentParser {
     fn parse_user_agent(&self, user_agent: &str) -> UserAgent {
         self.user_agent_matchers
             .iter()
-            .filter_map(|matcher| matcher.try_parse(user_agent))
-            .take(1)
-            .next()
+            .find_map(|matcher| matcher.try_parse(user_agent))
             .unwrap_or_default()
     }
 }
@@ -114,27 +111,82 @@ impl UserAgentParser {
     }
 
     pub fn try_from(regex_file: RegexFile) -> Result<UserAgentParser, Error> {
+        // TODO: Check device::Matcher::try_from for flag logic
+        let device_matcher = RegexSetBuilder::new(
+            regex_file
+                .device_parsers
+                .iter()
+                .map(|e| clean_escapes(&e.regex)),
+        )
+        .size_limit(20 * (1 << 23))
+        .build()
+        .map_err(DeviceError::from)?;
+        let os_matcher = RegexSetBuilder::new(
+            regex_file
+                .os_parsers
+                .iter()
+                .map(|e| clean_escapes(&e.regex)),
+        )
+        .size_limit(20 * (1 << 23))
+        .build()
+        .map_err(OSError::from)?;
+        let user_agent_matcher = RegexSetBuilder::new(
+            regex_file
+                .user_agent_parsers
+                .iter()
+                .map(|e| clean_escapes(&e.regex)),
+        )
+        .size_limit(20 * (1 << 23))
+        .build()
+        .map_err(UserAgentError::from)?;
+
         let mut device_matchers = Vec::new();
         let mut os_matchers = Vec::new();
         let mut user_agent_matchers = Vec::new();
 
-        for parser in regex_file.device_parsers.into_iter() {
+        for parser in regex_file.device_parsers {
             device_matchers.push(device::Matcher::try_from(parser)?);
         }
 
-        for parser in regex_file.os_parsers.into_iter() {
+        for parser in regex_file.os_parsers {
             os_matchers.push(os::Matcher::try_from(parser)?);
         }
 
-        for parser in regex_file.user_agent_parsers.into_iter() {
+        for parser in regex_file.user_agent_parsers {
             user_agent_matchers.push(user_agent::Matcher::try_from(parser)?);
         }
 
         Ok(UserAgentParser {
+            device_matcher,
             device_matchers,
+            os_matcher,
             os_matchers,
+            user_agent_matcher,
             user_agent_matchers,
         })
+    }
+
+    pub fn parse_device_set(&self, user_agent: &str) -> Device {
+        let mat = self.device_matcher.matches(user_agent).iter().next();
+        mat.and_then(|index| self.device_matchers.get(index))
+            .and_then(|matcher| matcher.try_parse(user_agent))
+            .unwrap_or_default()
+    }
+
+    /// Returns just the `OS` info when given a user agent string
+    pub fn parse_os_set(&self, user_agent: &str) -> OS {
+        let mat = self.os_matcher.matches(user_agent).iter().next();
+        mat.and_then(|index| self.os_matchers.get(index))
+            .and_then(|matcher| matcher.try_parse(user_agent))
+            .unwrap_or_default()
+    }
+
+    /// Returns just the `UserAgent` info when given a user agent string
+    pub fn parse_user_agent_set(&self, user_agent: &str) -> UserAgent {
+        let mat = self.user_agent_matcher.matches(user_agent).iter().next();
+        mat.and_then(|index| self.user_agent_matchers.get(index))
+            .and_then(|matcher| matcher.try_parse(user_agent))
+            .unwrap_or_default()
     }
 }
 
@@ -164,6 +216,6 @@ lazy_static::lazy_static! {
     static ref INVALID_ESCAPES: Regex = Regex::new("\\\\([! /])").unwrap();
 }
 
-fn clean_escapes(pattern: &str) -> Cow<'_, str> {
+pub fn clean_escapes(pattern: &str) -> Cow<'_, str> {
     INVALID_ESCAPES.replace_all(pattern, "$1")
 }
